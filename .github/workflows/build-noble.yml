@@ -1,4 +1,4 @@
-name: build-noble
+name: Build Ubuntu Noble ISO with Trezor Suite
 
 on:
   workflow_dispatch:
@@ -92,74 +92,84 @@ jobs:
           [[ "${GOODSIG:-0}" -ge 1 && -n "$SIG_FPR" && "$SIG_FPR" == "$TREZOR_FPR" ]] || {
             echo "Signature failed or fingerprint mismatch"; exit 13; }
 
-      # ---------- Repo patches: prevent daemons, install Trezor inside chroot ----------
-      - name: Prevent services from starting in chroot (policy-rc.d)
+      # ---------- Hardening to avoid "target is busy" ----------
+      - name: Ensure chroot services never start (policy-rc.d)
         run: |
           set -euo pipefail
           sudo mkdir -p scripts/chroot/usr/sbin
           sudo tee scripts/chroot/usr/sbin/policy-rc.d >/dev/null <<'EOF'
           #!/bin/sh
+          # Prevent starting daemons inside chroot during package installs
           exit 101
           EOF
           sudo chmod +x scripts/chroot/usr/sbin/policy-rc.d
 
-      - name: Patch scripts/build.sh to copy AppImage into chroot before chroot_build.sh
+      # ---------- Make upstream build put AppImage into chroot safely ----------
+      - name: Patch scripts/build.sh (inject copy to chroot)
         run: |
           set -euo pipefail
           f="scripts/build.sh"
-          # Insert a guarded copy right after 'chroot_enter_setup' call (present in upstream)
-          if grep -n 'chroot_enter_setup' "$f" >/dev/null 2>&1; then
-            sudo sed -i '/chroot_enter_setup/a \
-      # Inject pre-verified Trezor Suite into chroot\n\
-      if [ -s "$SCRIPT_DIR/trezor-suite.AppImage" ]; then sudo cp "$SCRIPT_DIR/trezor-suite.AppImage" "$SCRIPT_DIR/chroot/root/"; fi' "$f"
+          if grep -q 'chroot_enter_setup' "$f"; then
+            awk '
+              { print }
+              /chroot_enter_setup/ && !done {
+                print "      # Inject pre-verified Trezor Suite into chroot"
+                print "      if [ -s \\\"$SCRIPT_DIR/trezor-suite.AppImage\\\" ]; then sudo mkdir -p \\\"$SCRIPT_DIR/chroot/root\\\" && sudo cp \\\"$SCRIPT_DIR/trezor-suite.AppImage\\\" \\\"$SCRIPT_DIR/chroot/root/\\\"; fi"
+                done=1
+              }
+            ' "$f" | sudo tee "${f}.new" >/dev/null
+            sudo mv "${f}.new" "$f"
           else
-            echo "WARN: 'chroot_enter_setup' marker not found; leaving build.sh untouched"
+            echo "WARN: chroot_enter_setup not found; leaving build.sh untouched"
           fi
 
-      - name: Append Trezor installer to scripts/chroot_build.sh and call it
+      # ---------- Append Trezor install steps to run inside the chroot ----------
+      - name: Append Trezor installer block to scripts/chroot_build.sh
         run: |
           set -euo pipefail
           cb="scripts/chroot_build.sh"
-          cat >> "$cb" <<'EOF'
+          cat >> "$cb" <<'CHROOT_EOF'
 
-          # --- Added by CI: install Trezor Suite, udev rule, desktop entry ---
-          function customize_image_extra() {
-              set -euo pipefail
-              apt-get update
-              apt-get install -y --no-install-recommends libfuse2 udev curl
+          # --- Added by CI: Install Trezor Suite + udev + launcher inside the chroot ---
+          # Also ensure policy-rc.d exists inside the chroot (in case the host file was overwritten)
+          mkdir -p /usr/sbin
+          cat >/usr/sbin/policy-rc.d <<'PRC'
+          #!/bin/sh
+          exit 101
+          PRC
+          chmod +x /usr/sbin/policy-rc.d
 
-              install -d /opt/trezor /usr/share/applications
+          apt-get update
+          apt-get install -y --no-install-recommends libfuse2 udev curl
 
-              if [[ -s /root/trezor-suite.AppImage ]]; then
-                  mv /root/trezor-suite.AppImage /opt/trezor/trezor-suite.AppImage
-              else
-                  echo "Trezor AppImage missing at /root/trezor-suite.AppImage" >&2
-                  exit 90
-              fi
-              chmod +x /opt/trezor/trezor-suite.AppImage
+          install -d /opt/trezor /usr/share/applications
 
-              # udev rules (official Trezor host)
-              curl -fsSL "${TREZOR_UDEV_URL:-https://data.trezor.io/udev/51-trezor.rules}" \
-                -o /etc/udev/rules.d/51-trezor.rules || true
-              udevadm control --reload-rules || true
+          if [ -s /root/trezor-suite.AppImage ]; then
+            mv /root/trezor-suite.AppImage /opt/trezor/trezor-suite.AppImage
+            chmod +x /opt/trezor/trezor-suite.AppImage
+          else
+            echo "Trezor AppImage missing at /root/trezor-suite.AppImage" >&2
+            exit 90
+          fi
 
-              # Desktop launcher
-              cat > /usr/share/applications/trezor-suite.desktop <<'DESK'
-              [Desktop Entry]
-              Name=Trezor Suite
-              Comment=Manage your Trezor hardware wallet
-              Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
-              Terminal=false
-              Type=Application
-              Categories=Finance;Utility;
-              DESK
-          }
-          EOF
+          # udev rules (official Trezor host)
+          curl -fsSL "${TREZOR_UDEV_URL:-https://data.trezor.io/udev/51-trezor.rules}" \
+            -o /etc/udev/rules.d/51-trezor.rules || true
+          udevadm control --reload-rules || true
 
-          # Call it right after customize_image (match whole line)
-          sudo sed -i '/^[[:space:]]*customize_image[[:space:]]*$/a \ \ \ customize_image_extra' "$cb" || true
+          # Desktop launcher
+          cat > /usr/share/applications/trezor-suite.desktop <<'DESK'
+          [Desktop Entry]
+          Name=Trezor Suite
+          Comment=Manage your Trezor hardware wallet
+          Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
+          Terminal=false
+          Type=Application
+          Categories=Finance;Utility;
+          DESK
+          CHROOT_EOF
 
-      # ---------- Build with hard cleanup to avoid "target is busy" ----------
+      # ---------- Build with defensive cleanup ----------
       - name: Build ISO (noble) with cleanup guard
         run: |
           set -euo pipefail
