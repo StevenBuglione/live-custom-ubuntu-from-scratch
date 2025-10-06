@@ -1,226 +1,29 @@
-name: Build Ubuntu Noble ISO with Trezor Suite
+name: build-noble
 
 on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
   workflow_dispatch:
-    inputs:
-      trezor_tag:
-        description: "Optional: pin Trezor Suite tag (e.g. v25.9.3). Leave empty for latest."
-        required: false
-        default: ""
-  schedule:
-    - cron: "0 8 1 * *"  # monthly
-
-permissions:
-  contents: read
 
 jobs:
-  build-noble-trezor:
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        shell: bash
-    env:
-      ISO_NAME: ubuntu-noble-trezor
-      TREZOR_FPR: "EB483B26B078A4AA1B6F425EE21B6950A2ECB65C"
-      TREZOR_KEY_URL: "https://trezor.io/security/satoshilabs-2021-signing-key.asc"
-      TREZOR_UDEV_URL: "https://data.trezor.io/udev/51-trezor.rules"
+  build:
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v2
 
-      - name: Host prerequisites
+      - name: Build
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            jq curl ca-certificates file \
-            gnupg dirmngr gpg-agent \
-            psmisc lsof
-
-      # ---------- Fetch & verify Trezor Suite ----------
-      - name: Fetch latest (or pinned) Trezor Suite AppImage + signature
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="${{ github.event.inputs.trezor_tag }}"
-          API="https://api.github.com/repos/trezor/trezor-suite/releases"
-          URL=${TAG:+$API/tags/${TAG}}
-          URL=${URL:-$API/latest}
-          echo "GET $URL"
-          curl -fsSL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$URL" -o release.json
-          jq -r '.tag_name, .assets[]?.name' release.json || true
-
-          APP_ID=$(jq -r '.assets[] | select(.name|test("AppImage$")) | .id' release.json | head -n1)
-          ASC_ID=$(jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .id' release.json | head -n1)
-          test -n "$APP_ID" && test -n "$ASC_ID" || { echo "AppImage/.asc not found"; jq -r '.assets[]?.name' release.json; exit 12; }
-
-          dl() {
-            local id="$1" out="$2"
-            curl -fsSLo "$out" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/octet-stream" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/trezor/trezor-suite/releases/assets/${id}"
-          }
-          dl "$APP_ID" trezor-suite.AppImage
-          dl "$ASC_ID" trezor-suite.AppImage.asc
-          chmod +x trezor-suite.AppImage
-          file trezor-suite.AppImage || true
-
-      - name: Verify Trezor Suite signature (pinned VALIDSIG fingerprint)
-        run: |
-          set -euo pipefail
-          export GNUPGHOME="$PWD/gnupg"
-          mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-          curl -fsSL "${TREZOR_KEY_URL}" -o trezor.asc
-          gpg --batch --import trezor.asc
-
-          gpg --status-fd=1 --batch --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
-            1> gpg-status.log 2> gpg-stderr.log || true
-
-          GOODSIG=$(awk 'BEGIN{c=0} /^\[GNUPG:\] GOODSIG /{c++} END{print c}' gpg-status.log)
-          SIG_FPR=$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' gpg-status.log)
-          echo "GOODSIG count: ${GOODSIG:-0}"
-          echo "VALIDSIG fingerprint: ${SIG_FPR:-missing}"
-
-          [[ "${GOODSIG:-0}" -ge 1 && -n "$SIG_FPR" && "$SIG_FPR" == "$TREZOR_FPR" ]] || {
-            echo "Signature failed or fingerprint mismatch"; exit 13; }
-
-      # ---------- Hardening to avoid "target is busy" ----------
-      - name: Ensure chroot services never start (policy-rc.d)
-        run: |
-          set -euo pipefail
-          sudo mkdir -p scripts/chroot/usr/sbin
-          sudo tee scripts/chroot/usr/sbin/policy-rc.d >/dev/null <<'EOF'
-          #!/bin/sh
-          # Prevent starting daemons inside chroot during package installs
-          exit 101
-          EOF
-          sudo chmod +x scripts/chroot/usr/sbin/policy-rc.d
-
-      # ---------- Make upstream build put AppImage into chroot safely ----------
-      - name: Patch scripts/build.sh (inject copy to chroot)
-        run: |
-          set -euo pipefail
-          f="scripts/build.sh"
-          if grep -q 'chroot_enter_setup' "$f"; then
-            awk '
-              { print }
-              /chroot_enter_setup/ && !done {
-                print "      # Inject pre-verified Trezor Suite into chroot"
-                print "      if [ -s \\\"$SCRIPT_DIR/trezor-suite.AppImage\\\" ]; then sudo mkdir -p \\\"$SCRIPT_DIR/chroot/root\\\" && sudo cp \\\"$SCRIPT_DIR/trezor-suite.AppImage\\\" \\\"$SCRIPT_DIR/chroot/root/\\\"; fi"
-                done=1
-              }
-            ' "$f" | sudo tee "${f}.new" >/dev/null
-            sudo mv "${f}.new" "$f"
-          else
-            echo "WARN: chroot_enter_setup not found; leaving build.sh untouched"
-          fi
-
-      # ---------- Append Trezor install steps to run inside the chroot ----------
-      - name: Append Trezor installer block to scripts/chroot_build.sh
-        run: |
-          set -euo pipefail
-          cb="scripts/chroot_build.sh"
-          cat >> "$cb" <<'CHROOT_EOF'
-
-          # --- Added by CI: Install Trezor Suite + udev + launcher inside the chroot ---
-          # Also ensure policy-rc.d exists inside the chroot (in case the host file was overwritten)
-          mkdir -p /usr/sbin
-          cat >/usr/sbin/policy-rc.d <<'PRC'
-          #!/bin/sh
-          exit 101
-          PRC
-          chmod +x /usr/sbin/policy-rc.d
-
-          apt-get update
-          apt-get install -y --no-install-recommends libfuse2 udev curl
-
-          install -d /opt/trezor /usr/share/applications
-
-          if [ -s /root/trezor-suite.AppImage ]; then
-            mv /root/trezor-suite.AppImage /opt/trezor/trezor-suite.AppImage
-            chmod +x /opt/trezor/trezor-suite.AppImage
-          else
-            echo "Trezor AppImage missing at /root/trezor-suite.AppImage" >&2
-            exit 90
-          fi
-
-          # udev rules (official Trezor host)
-          curl -fsSL "${TREZOR_UDEV_URL:-https://data.trezor.io/udev/51-trezor.rules}" \
-            -o /etc/udev/rules.d/51-trezor.rules || true
-          udevadm control --reload-rules || true
-
-          # Desktop launcher
-          cat > /usr/share/applications/trezor-suite.desktop <<'DESK'
-          [Desktop Entry]
-          Name=Trezor Suite
-          Comment=Manage your Trezor hardware wallet
-          Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
-          Terminal=false
-          Type=Application
-          Categories=Finance;Utility;
-          DESK
-          CHROOT_EOF
-
-      # ---------- Build with defensive cleanup ----------
-      - name: Build ISO (noble) with cleanup guard
-        run: |
-          set -euo pipefail
-          CHROOT="$GITHUB_WORKSPACE/scripts/chroot"
-
-          cleanup() {
-            set +e
-            echo "::group::Chroot mount tree (pre-cleanup)"; sudo findmnt -R "$CHROOT" || true; echo "::endgroup::"
-
-            echo "Killing processes holding $CHROOT ..."
-            sudo fuser -km "$CHROOT" 2>/dev/null || true
-            sudo lsof +f -- "$CHROOT" 2>/dev/null | awk 'NR>1{print $2}' | sort -u | xargs -r sudo kill -9 || true
-
-            for p in run dev/pts dev/shm dev proc sys; do
-              if mountpoint -q "$CHROOT/$p"; then
-                sudo umount -R "$CHROOT/$p" 2>/dev/null || sudo umount "$CHROOT/$p" 2>/dev/null || sudo umount -l "$CHROOT/$p" || true
-              fi
-            done
-            sudo umount -R "$CHROOT" 2>/dev/null || true
-            sudo umount -l "$CHROOT" 2>/dev/null || true
-
-            echo "::group::Chroot mount tree (post-cleanup)"; sudo findmnt -R "$CHROOT" || true; echo "::endgroup::"
-          }
-          trap cleanup EXIT
-
-          pushd scripts
-          time bash build.sh noble
-          popd
-
-      - name: Collect ISO + checksums
-        run: |
-          set -euo pipefail
-          ISO="scripts/${ISO_NAME}.iso"
-          if [[ ! -f "$ISO" ]]; then
-            ISO=$(ls -1 scripts/*.iso | head -n1 || true)
-          fi
-          [[ -n "${ISO:-}" && -f "$ISO" ]] || { echo "ISO not found"; ls -lah scripts || true; exit 2; }
-          cp "$ISO" "${ISO_NAME}.iso"
-          sha256sum "${ISO_NAME}.iso" | tee "${ISO_NAME}.iso.sha256"
-          ls -lah "${ISO_NAME}.iso"*
-
-      - name: Upload artifacts (ISO + logs)
-        if: always()
+          cd scripts
+          sed -i -E 's/TARGET_UBUNTU_VERSION=(.*)/TARGET_UBUNTU_VERSION="noble"/g' default_config.sh
+          ./build.sh -
+          cd ..
+      - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ubuntu-noble-trezor-iso-and-logs
+          name: ubuntu-from-scratch
           path: |
-            ${ISO_NAME}.iso
-            ${ISO_NAME}.iso.sha256
-            gpg-status.log
-            gpg-stderr.log
-            release.json
-            scripts/chroot/var/log/**
-          retention-days: 14
+            scripts/ubuntu-from-scratch.iso
+            scripts/image/md5sum.txt
