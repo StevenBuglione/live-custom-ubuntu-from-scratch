@@ -1,4 +1,4 @@
-name: Build Ubuntu Noble ISO with Trezor Suite
+name: build-noble
 
 on:
   workflow_dispatch:
