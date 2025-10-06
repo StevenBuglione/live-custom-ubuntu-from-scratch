@@ -32,13 +32,11 @@ umount_if_mounted() {
 # Kill any processes holding files under chroot
 kill_chroot_procs() {
   local root="$1"
-  # Try a soft pass to show holders
   sudo fuser -vm "$root" || true
-  # Then kill (may need a couple passes)
   for _ in {1..3}; do
     sudo fuser -kvm "$root" || true
     sleep 1
-  end
+  done
 }
 
 # ------------------- UI -------------------
@@ -104,24 +102,21 @@ function check_config() {
 # ------------------- chroot lifecycle -------------------
 
 function chroot_enter_setup() {
-  # Prepare mountpoints
   sudo mkdir -p chroot/{dev,proc,sys,run,dev/pts}
-  # Bind/virtual mounts (idempotent)
   mount_if_needed /dev        chroot/dev
   mount_if_needed /run        chroot/run
   mount_if_needed proc        chroot/proc proc
   mount_if_needed sysfs       chroot/sys  sysfs
   mount_if_needed devpts      chroot/dev/pts devpts "gid=5,mode=620"
 
-  # Prevent services from actually starting inside chroot
-  # (return 101 makes maintainer scripts skip service starts)
+  # Prevent services from starting inside chroot
   sudo tee chroot/usr/sbin/policy-rc.d >/dev/null <<'EOF'
 #!/bin/sh
 exit 101
 EOF
   sudo chmod +x chroot/usr/sbin/policy-rc.d
 
-  # Divert invoke-rc.d to no-op during build
+  # Divert invoke-rc.d to a no-op during build
   if ! sudo chroot chroot dpkg-divert --list /usr/sbin/invoke-rc.d >/dev/null 2>&1; then
     sudo chroot chroot dpkg-divert --local --rename --add /usr/sbin/invoke-rc.d || true
     sudo chroot chroot /bin/sh -c 'printf "%s\n" "#!/bin/sh" "exit 0" > /usr/sbin/invoke-rc.d'
@@ -130,26 +125,25 @@ EOF
 }
 
 function chroot_exit_teardown() {
-  # Remove service start blockers so the produced image is clean
+  # Remove blockers so the produced image is clean
   sudo rm -f chroot/usr/sbin/policy-rc.d || true
   if sudo chroot chroot test -f /usr/sbin/invoke-rc.d.distrib 2>/dev/null; then
     sudo chroot chroot rm -f /usr/sbin/invoke-rc.d || true
     sudo chroot chroot dpkg-divert --rename --remove /usr/sbin/invoke-rc.d || true
   fi
 
-  # Kill any lingering processes inside chroot
+  # Kill lingering processes
   kill_chroot_procs "chroot"
 
-  # Unmount in reverse dependency order
+  # Unmount in reverse dep order
   umount_if_mounted chroot/dev/pts
   umount_if_mounted chroot/dev
   umount_if_mounted chroot/proc
   umount_if_mounted chroot/sys
   umount_if_mounted chroot/run
 
-  # Last resort: lazy recursive unmount of anything still attached
+  # Last resort: lazy recursive unmount for anything left
   if grep -q "$(readlink -f "$SCRIPT_DIR")/chroot" /proc/mounts; then
-    # Unmount deepest first
     grep "$(readlink -f "$SCRIPT_DIR")/chroot" /proc/mounts \
       | awk '{print $2}' | sort -r \
       | xargs -r -n1 sudo umount -l || true
@@ -168,7 +162,7 @@ trap cleanup EXIT INT TERM
 function setup_host() {
   echo "=====> running setup_host ..."
   sudo apt-get update -y
-  sudo apt-get install -y debootstrap squashfs-tools xorriso genisoimage rsync fuser
+  sudo apt-get install -y debootstrap squashfs-tools xorriso genisoimage rsync psmisc
   sudo mkdir -p chroot
 }
 
@@ -198,7 +192,7 @@ function run_chroot() {
 function build_iso() {
   echo "=====> running build_iso ..."
 
-  # Ensure chroot is fully unmounted before packaging (trap already does this, but be explicit)
+  # Ensure chroot is fully unmounted before packaging
   chroot_exit_teardown
 
   # Move image artifacts out of chroot
@@ -212,11 +206,10 @@ function build_iso() {
     -noappend -no-duplicates -no-recovery \
     -wildcards \
     -comp xz -b 1M -Xdict-size 100% \
+    -e "var/cache/apt/apt/archive/*" \
     -e "var/cache/apt/archives/*" \
-    -e "root/*" \
-    -e "root/.*" \
-    -e "tmp/*" \
-    -e "tmp/.*" \
+    -e "root/*" -e "root/.*" \
+    -e "tmp/*"  -e "tmp/.*" \
     -e "swapfile"
 
   # Write filesystem.size
@@ -276,16 +269,17 @@ start_index=0
 end_index=${#CMD[*]}
 for ii in "$@"; do
   if [[ "$ii" == "-" ]]; then
-    dash_flag=true; continue
+    dash_flag=true
+    continue
   fi
   find_index "$ii"
-  if ! $dash_flag; then
+  if [[ "$dash_flag" == false ]]; then
     start_index=$index
   else
     end_index=$((index+1))
   fi
 done
-if ! $dash_flag; then
+if [[ "$dash_flag" == false ]]; then
   end_index=$((start_index + 1))
 fi
 
